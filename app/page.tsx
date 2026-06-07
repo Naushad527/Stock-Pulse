@@ -9,7 +9,7 @@ import { WatchlistPanel } from '@/components/watchlist-panel'
 import { MarketSentiment } from '@/components/market-sentiment'
 import { RecentlyViewed } from '@/components/recently-viewed'
 import { StockCard } from '@/components/stock-card'
-import { getAllStocks, StockQuote } from '@/lib/api'
+import { getAllStocks, getStockQuote, StockQuote } from '@/lib/api'
 
 type SortBy = 'name' | 'price' | 'change' | 'marketCap'
 
@@ -21,10 +21,23 @@ export default function HomePage() {
   const [showFilters, setShowFilters] = useState(false)
 
   const { data: allStocks, isLoading } = useSWR(
-    ['stocks', 'ALL'],
-    () => getAllStocks(),
-    { revalidateOnFocus: false, refreshInterval: 30000 }
+  ['stocks', 'ALL'],
+  async () => {
+  const stocks = await getAllStocks()
+
+  await Promise.all(
+    stocks
+      .filter((s) => s.country === 'IN')
+      .map((s) => getStockQuote(s.symbol))
   )
+
+  return await getAllStocks()
+},
+  {
+    revalidateOnFocus: false,
+    refreshInterval: 30000,
+  }
+)
 
   const filteredStocks = allStocks
     ?.filter((stock) => sector === 'All' || stock.sector === sector)

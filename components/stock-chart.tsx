@@ -120,8 +120,8 @@ export function StockChart({ symbol, isGain }: StockChartProps) {
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
         </div>
       ) : chartData && chartData.length > 0 ? (
-        <div className="h-80">
-          <ResponsiveContainer width="100%" height="100%">
+        <div className="h-[350px] w-full">
+  <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={chartData}>
               <defs>
                 <linearGradient id="colorChart" x1="0" y1="0" x2="0" y2="1">

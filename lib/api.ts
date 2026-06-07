@@ -1,8 +1,10 @@
-import axios from 'axios'
 
-const API_KEY = process.env.ALPHA_VANTAGE_API_KEY || process.env.NEXT_PUBLIC_ALPHA_VANTAGE_API_KEY || 'demo'
-const BASE_URL = 'https://www.alphavantage.co/query'
 
+const FINNHUB_API_KEY =
+  process.env.NEXT_PUBLIC_FINNHUB_API_KEY || ''
+
+const TWELVE_BASE_URL = 'https://api.twelvedata.com'
+const FINNHUB_BASE_URL = 'https://finnhub.io/api/v1'
 // Types
 export interface StockQuote {
   symbol: string
@@ -237,6 +239,42 @@ const indianStocks: Record<string, Omit<StockQuote, 'price' | 'change' | 'change
 // Combine all stocks
 const allStocksBase = { ...usStocks, ...indianStocks }
 
+const liveMarketSymbols = [
+  'AAPL',
+  'MSFT',
+  'GOOGL',
+  'AMZN',
+  'NVDA',
+  'META',
+  'TSLA',
+  'AMD',
+  'JPM',
+  'GS',
+  'COP',
+  'BA',
+  'ORCL',
+  'PYPL',
+  'PLTR',
+  'SNOW',
+  'RELIANCE.NS',
+  'TCS.NS',
+  'HDFCBANK.NS',
+  'INFY.NS',
+  'ICICIBANK.NS',
+  'SBIN.NS',
+  'TATAMOTORS.NS',
+  'ONGC.NS',
+  'ITC.NS',
+'BHARTIARTL.NS',
+'BAJFINANCE.NS',
+'LT.NS',
+'KOTAKBANK.NS',
+'AXISBANK.NS',
+'HCLTECH.NS',
+'SUNPHARMA.NS',
+'MARUTI.NS',
+]
+
 // Generate realistic stock prices
 function generateStockPrice(baseData: typeof allStocksBase[string]): StockQuote {
   const isIndian = baseData.country === 'IN'
@@ -272,6 +310,8 @@ let stockCache: Record<string, { stock: StockQuote; source: 'api' | 'mock'; fetc
 const REAL_DATA_CACHE_DURATION = 60000 // 1 minute for real API data
 const MOCK_DATA_CACHE_DURATION = 5000 // 5 seconds for mock fallback
 let pendingRequests: Record<string, Promise<StockQuote | null>> = {} // Deduplication
+let liveMarketSnapshot: { stocks: StockQuote[]; fetchedAt: number } | null = null
+let pendingLiveMarketSnapshot: Promise<StockQuote[]> | null = null
 
 function generateMockStockCache(): Record<string, StockQuote> {
   const cache: Record<string, StockQuote> = {}
@@ -466,11 +506,21 @@ export async function getStockQuote(symbol: string): Promise<StockQuote | null> 
   // Ensure cache is initialized
   ensureCacheInitialized()
   
-  const upperSymbol = symbol.toUpperCase()
+  const upperSymbol = symbol.trim().toUpperCase()
+  if (!upperSymbol) return null
+  const isIndianStock = upperSymbol.endsWith('.NS')
+  const hasProviderKey = isIndianStock
+    ? false
+    : Boolean(FINNHUB_API_KEY && FINNHUB_API_KEY !== 'demo')
   
   // 1. Check if we have fresh cache
-  if (stockCache[upperSymbol] && !isCacheExpired(upperSymbol)) {
-    return stockCache[upperSymbol].stock
+  const cachedEntry = stockCache[upperSymbol]
+  if (
+    cachedEntry &&
+    !isCacheExpired(upperSymbol) &&
+    (cachedEntry.source === 'api' || !hasProviderKey)
+  ) {
+    return cachedEntry.stock
   }
   
   // 2. Prevent duplicate simultaneous requests for same symbol
@@ -480,74 +530,173 @@ export async function getStockQuote(symbol: string): Promise<StockQuote | null> 
   
   // 3. Create request promise
   const request = (async () => {
-    try {
-      // Try real API first (if key is valid)
-      if (API_KEY && API_KEY !== 'demo') {
-        console.log(`[API] Fetching real data for ${upperSymbol}...`)
-        
-        const response = await axios.get(BASE_URL, {
-          params: {
-            function: 'GLOBAL_QUOTE',
-            symbol: upperSymbol,
-            apikey: API_KEY,
-          },
-          timeout: 10000,
+    const baseData = allStocksBase[upperSymbol]
+    const mockCache = generateMockStockCache()[upperSymbol]
+
+    const toNumber = (value: unknown, fallback = 0): number => {
+      if (typeof value === 'number') return Number.isFinite(value) ? value : fallback
+      if (typeof value === 'string') {
+        const parsed = Number.parseFloat(value)
+        return Number.isFinite(parsed) ? parsed : fallback
+      }
+      return fallback
+    }
+
+    const toInteger = (value: unknown, fallback = 0): number => {
+      if (typeof value === 'number') return Number.isFinite(value) ? Math.trunc(value) : fallback
+      if (typeof value === 'string') {
+        const parsed = Number.parseInt(value, 10)
+        return Number.isFinite(parsed) ? parsed : fallback
+      }
+      return fallback
+    }
+
+    const cacheAndReturn = (stock: StockQuote, source: 'api' | 'mock') => {
+      stockCache[upperSymbol] = { stock, source, fetchedAt: Date.now() }
+      return stock
+    }
+
+    const fallbackToMock = (message?: string): StockQuote | null => {
+      if (message) console.warn(message)
+      console.log(`[Fallback] Using mock data for ${upperSymbol}`)
+
+      if (mockCache) {
+        return cacheAndReturn(mockCache, 'mock')
+      }
+
+      return null
+    }
+
+    const fetchJson = async <T>(url: string, provider: string): Promise<T> => {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 10000)
+
+      try {
+        const response = await fetch(url, {
+          cache: 'no-store',
+          signal: controller.signal,
         })
 
-        const data = response.data['Global Quote']
-        
-        if (data && Object.keys(data).length > 0 && data['05. price']) {
-          const realQuote: StockQuote = {
-            symbol: data['01. symbol'] || upperSymbol,
-            name: data['01. symbol'] || upperSymbol,
-            price: parseFloat(data['05. price']) || 0,
-            change: parseFloat(data['09. change']) || 0,
-            changePercent: parseFloat(data['10. change percent']?.replace('%', '') || '0'),
-            high: parseFloat(data['03. high']) || 0,
-            low: parseFloat(data['04. low']) || 0,
-            open: parseFloat(data['02. open']) || 0,
-            previousClose: parseFloat(data['08. previous close']) || 0,
-            volume: parseInt(data['06. volume']) || 0,
-            exchange: 'API',
-            country: 'US',
-          }
-          
-          console.log(`[API] ✓ Got real data for ${upperSymbol}: $${realQuote.price}`)
-          
-          // Cache real data
-          stockCache[upperSymbol] = { stock: realQuote, source: 'api', fetchedAt: Date.now() }
-          delete pendingRequests[upperSymbol]
-          return realQuote
+        if (!response.ok) {
+          throw new Error(`${provider} returned ${response.status} for ${upperSymbol}`)
         }
+
+        return (await response.json()) as T
+      } finally {
+        clearTimeout(timeoutId)
       }
-      
-      // 4. Fallback to mock data if API unavailable or failed
-      console.log(`[Fallback] Using mock data for ${upperSymbol}`)
-      const mockCache = generateMockStockCache()[upperSymbol]
-      
-      if (mockCache) {
-        stockCache[upperSymbol] = { stock: mockCache, source: 'mock', fetchedAt: Date.now() }
-        delete pendingRequests[upperSymbol]
-        return mockCache
+    }
+
+    try {
+      if (isIndianStock) {
+  try {
+    const response = await fetch(
+      `http://localhost:3000/api/indian-stock?symbol=${encodeURIComponent(
+        upperSymbol
+      )}`
+    )
+
+    if (!response.ok) {
+      throw new Error(`Indian stock API returned ${response.status}`)
+    }
+
+    const data = await response.json()
+
+    const realQuote: StockQuote = {
+      ...baseData,
+      symbol: data.symbol,
+      name: data.name || upperSymbol,
+      price: Number(data.price || 0),
+      change: Number(data.change || 0),
+      changePercent: Number(data.changePercent || 0),
+      high: Number(data.high || 0),
+      low: Number(data.low || 0),
+      open: Number(data.open || 0),
+      previousClose: Number(data.previousClose || 0),
+      volume: Number(data.volume || 0),
+      exchange: 'NSE',
+      country: 'IN',
+    }
+
+    return cacheAndReturn(realQuote, 'api')
+  } catch (error) {
+    console.warn(
+      `[Yahoo Finance] Failed for ${upperSymbol}:`,
+      error
+    )
+
+    return fallbackToMock()
+  }
+}
+
+      if (!FINNHUB_API_KEY || FINNHUB_API_KEY === 'demo') {
+        return fallbackToMock(`[Fallback] Finnhub API key is missing for ${upperSymbol}`)
       }
-      
-      delete pendingRequests[upperSymbol]
-      return null
+
+      const params = new URLSearchParams({
+        symbol: upperSymbol,
+        token: FINNHUB_API_KEY,
+      })
+
+      console.log(`[API] Fetching Finnhub quote for ${upperSymbol}...`)
+
+      const data = await fetchJson<{
+        c?: number
+        d?: number
+        dp?: number
+        h?: number
+        l?: number
+        o?: number
+        pc?: number
+        error?: string
+      }>(`${FINNHUB_BASE_URL}/quote?${params.toString()}`, 'Finnhub')
+
+      if (data.error) {
+        throw new Error(data.error)
+      }
+
+      const price = toNumber(data.c)
+      if (price <= 0) {
+        throw new Error(`Finnhub did not return a valid current price for ${upperSymbol}`)
+      }
+
+      const previousClose = toNumber(data.pc)
+      const change = toNumber(data.d, previousClose ? price - previousClose : 0)
+
+      const realQuote: StockQuote = {
+        ...baseData,
+        symbol: upperSymbol,
+        name: baseData?.name || upperSymbol,
+        price,
+        change,
+        changePercent: toNumber(
+          data.dp,
+          previousClose ? (change / previousClose) * 100 : 0
+        ),
+        high: toNumber(data.h, price),
+        low: toNumber(data.l, price),
+        open: toNumber(data.o, previousClose || price),
+        previousClose: previousClose || price - change,
+        volume: mockCache?.volume || baseData?.avgVolume || 0,
+        exchange: baseData?.exchange || 'US',
+        country: 'US',
+      }
+
+      console.log(`[API] Got Finnhub quote for ${upperSymbol}: ${realQuote.price}`)
+      return cacheAndReturn(realQuote, 'api')
     } catch (error) {
       console.warn(`[Error] Failed to fetch ${upperSymbol}:`, error instanceof Error ? error.message : error)
-      
-      // Try mock fallback
-      const mockCache = generateMockStockCache()[upperSymbol]
-      if (mockCache) {
-        stockCache[upperSymbol] = { stock: mockCache, source: 'mock', fetchedAt: Date.now() }
-      }
-      
-      delete pendingRequests[upperSymbol]
-      return mockCache || null
+      return fallbackToMock()
     }
   })()
   
   pendingRequests[upperSymbol] = request
+  void request.finally(() => {
+    if (pendingRequests[upperSymbol] === request) {
+      delete pendingRequests[upperSymbol]
+    }
+  })
+
   return request
 }
 
@@ -558,20 +707,59 @@ export async function getStockHistory(
   return generateCandlestickData(symbol, range)
 }
 
-export async function getTopGainers(limit = 10): Promise<StockQuote[]> {
-  // Ensure cache is initialized (for consistency)
+async function getLiveMarketSnapshot(): Promise<StockQuote[]> {
   ensureCacheInitialized()
-  
-  const cacheKeys = Object.keys(stockCache)
-  console.log('[getTopGainers] Cache has', cacheKeys.length, 'entries')
-  
-  const cache = Object.values(stockCache)
-    .filter(entry => entry?.stock)
-    .map(entry => entry.stock)
-  
-  console.log('[getTopGainers] Extracted', cache.length, 'stocks')
-  
-  const result = cache
+
+  if (
+    liveMarketSnapshot &&
+    Date.now() - liveMarketSnapshot.fetchedAt < REAL_DATA_CACHE_DURATION
+  ) {
+    return liveMarketSnapshot.stocks
+  }
+
+  if (pendingLiveMarketSnapshot) {
+    return pendingLiveMarketSnapshot
+  }
+
+  pendingLiveMarketSnapshot = (async () => {
+    try {
+      const quotes = await Promise.all(
+        liveMarketSymbols.map(async (symbol) => {
+          try {
+            return await getStockQuote(symbol)
+          } catch (error) {
+            console.warn(
+              `[Live Snapshot] Failed to refresh ${symbol}:`,
+              error instanceof Error ? error.message : error
+            )
+            return stockCache[symbol]?.stock || null
+          }
+        })
+      )
+
+      const stocks = quotes.filter((stock): stock is StockQuote => Boolean(stock))
+      const fallbackStocks = Object.values(stockCache)
+        .filter(entry => entry?.stock)
+        .map(entry => entry.stock)
+
+      const snapshotStocks = stocks.length > 0 ? stocks : fallbackStocks
+      liveMarketSnapshot = {
+        stocks: snapshotStocks,
+        fetchedAt: Date.now(),
+      }
+
+      return snapshotStocks
+    } finally {
+      pendingLiveMarketSnapshot = null
+    }
+  })()
+
+  return pendingLiveMarketSnapshot
+}
+
+export async function getTopGainers(limit = 10): Promise<StockQuote[]> {
+  const stocks = await getLiveMarketSnapshot()
+  const result = stocks
     .filter(stock => stock.changePercent > 0)
     .sort((a, b) => b.changePercent - a.changePercent)
     .slice(0, limit)
@@ -581,22 +769,16 @@ export async function getTopGainers(limit = 10): Promise<StockQuote[]> {
 }
 
 export async function getTopLosers(limit = 10): Promise<StockQuote[]> {
-  const cache = Object.values(stockCache)
-    .filter(entry => entry?.stock)
-    .map(entry => entry.stock)
-  
-  return cache
+  const stocks = await getLiveMarketSnapshot()
+  return stocks
     .filter(stock => stock.changePercent < 0)
     .sort((a, b) => a.changePercent - b.changePercent)
     .slice(0, limit)
 }
 
 export async function getMostActive(limit = 10): Promise<StockQuote[]> {
-  const cache = Object.values(stockCache)
-    .filter(entry => entry?.stock)
-    .map(entry => entry.stock)
-  
-  return cache
+  const stocks = await getLiveMarketSnapshot()
+  return stocks
     .sort((a, b) => b.volume - a.volume)
     .slice(0, limit)
 }
@@ -617,46 +799,88 @@ export async function searchStocks(query: string): Promise<StockQuote[]> {
     .slice(0, 20)
 }
 
-export function getAllStocks(): StockQuote[] {
-  // Ensure cache is initialized
+export async function getAllStocks(): Promise<StockQuote[]> {
   ensureCacheInitialized()
-  
-  // Extract stocks from cache using same pattern as getTopGainers()
+
   const stocks = Object.values(stockCache)
     .filter(entry => entry?.stock)
     .map(entry => entry.stock)
-  
-  console.log('[getAllStocks] Returning', stocks.length, 'stocks')
-  
-  // Trigger background fetches for real data (non-blocking)
-  if (stocks.length > 0) {
-    stocks.slice(0, 20).forEach(stock => {
-      // Trigger async fetch without awaiting
-      if (!(stock.symbol in pendingRequests)) {
-        getStockQuote(stock.symbol).catch(err => {
-          // Silently fail - mock data will remain
-        })
+
+  const indianSymbols = [
+    'RELIANCE.NS',
+    'TCS.NS',
+    'HDFCBANK.NS',
+    'INFY.NS',
+    'ICICIBANK.NS',
+    'SBIN.NS',
+    'TATAMOTORS.NS',
+    'ONGC.NS',
+     'ITC.NS',
+  'BHARTIARTL.NS',
+  'BAJFINANCE.NS',
+  'LT.NS',
+  'KOTAKBANK.NS',
+  'AXISBANK.NS',
+  'HCLTECH.NS',
+  'SUNPHARMA.NS',
+  'MARUTI.NS',
+  ]
+
+  await Promise.all(
+    indianSymbols.map(async (symbol) => {
+      try {
+        await getStockQuote(symbol)
+      } catch (e) {
+        console.warn(`Failed refresh ${symbol}`)
       }
     })
-  }
-  
-  return stocks
+  )
+
+  return Object.values(stockCache)
+    .filter(entry => entry?.stock)
+    .map(entry => entry.stock)
 }
+
 
 export function getUSStocks(): StockQuote[] {
   const cache = getStockCache()
   return Object.values(cache).filter(s => s.country === 'US')
 }
 
-export function getIndianStocks(): StockQuote[] {
-  const cache = getStockCache()
-  return Object.values(cache).filter(s => s.country === 'IN')
+export async function getIndianStocks(): Promise<StockQuote[]> {
+  const symbols = [
+    'RELIANCE.NS',
+    'TCS.NS',
+    'HDFCBANK.NS',
+    'INFY.NS',
+    'ICICIBANK.NS',
+    'SBIN.NS',
+    'TATAMOTORS.NS',
+    'ONGC.NS',
+    'ITC.NS',
+  'BHARTIARTL.NS',
+  'BAJFINANCE.NS',
+  'LT.NS',
+  'KOTAKBANK.NS',
+  'AXISBANK.NS',
+  'HCLTECH.NS',
+  'SUNPHARMA.NS',
+  'MARUTI.NS',
+  ]
+
+  await Promise.all(symbols.map(symbol => getStockQuote(symbol)))
+
+  return Object.values(stockCache)
+    .filter(entry => entry?.stock?.country === 'IN')
+    .map(entry => entry.stock)
 }
 
-export function getStocksByMarket(market: 'US' | 'IN' | 'ALL'): StockQuote[] {
-  if (market === 'ALL') return getAllStocks()
+export async function getStocksByMarket(
+  market: 'US' | 'IN' | 'ALL'
+): Promise<StockQuote[]> {
+  if (market === 'ALL') return await getAllStocks()
   if (market === 'US') return getUSStocks()
-  return getIndianStocks()
+  return await getIndianStocks()
 }
 
 export function getStocksBySector(sector: string): StockQuote[] {
@@ -943,3 +1167,6 @@ function ensureCacheInitialized() {
 
 // Call initialization immediately
 ensureCacheInitialized()
+setTimeout(() => {
+  getIndianStocks().catch(console.error)
+}, 1000)

@@ -88,8 +88,11 @@ export function NewsList() {
 
   return (
     <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-      {news.map((article) => (
-        <NewsCard key={article.id} article={article} />
+      {news.map((article, index) => (
+       <NewsCard
+  key={`${article.id}-${index}`}
+  article={article}
+/>
       ))}
     </div>
   )
